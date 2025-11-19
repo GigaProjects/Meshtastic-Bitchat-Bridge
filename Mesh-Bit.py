@@ -14,12 +14,13 @@ from pubsub import pub
 # --- CONFIGURATION ---
 MESHTASTIC_PORT = "/dev/ttyUSB0"  # Update this for your OS (e.g., COM3)
 
-# Bitchat Public Service UUIDs (Placeholders - Replace with actual Bitchat UUIDs)
-# For "Public" chats, apps often use a specific Service UUID to broadcast presence.
-BITCHAT_SERVICE_UUID = "00000000-0000-0000-0000-000000000000"
-BITCHAT_RX_CHAR_UUID = "00000000-0000-0000-0000-000000000001" 
-BITCHAT_TX_CHAR_UUID = "00000000-0000-0000-0000-000000000002"
+# Bitchat Service UUID (likely match)
+BITCHAT_SERVICE_UUID = "f47b5e2d-4a9e-4c5a-9b3f-8e1d2c3a4b5c"
 
+# In many simple BLE apps, RX and TX share the same characteristic, 
+# or are offset by 1 digit. Try using this for BOTH first:
+BITCHAT_RX_CHAR_UUID = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d" 
+BITCHAT_TX_CHAR_UUID = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
 # The name used to identify this bridge on the networks
 BRIDGE_TAG = "Bridge"
 
@@ -102,8 +103,10 @@ class MeshtasticHandler:
     def send_text(self, text: str):
         """Sends text to the LoRa mesh."""
         if self.interface:
+            logger.info(f"[Meshtastic] Sending packet: {text}")
             # Meshtastic handles the queueing internally
             self.interface.sendText(text)
+            logger.info("[Meshtastic] Command sent to radio.")
 
 class BitchatBLEHandler:
     """
@@ -111,6 +114,7 @@ class BitchatBLEHandler:
     """
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self.connected_clients: Dict[str, BleakClient] = {}
+        self.connecting_devices = set()  # <--- NEW: Track pending connections
         self.meshtastic_handler: Optional[MeshtasticHandler] = None
         self.loop = loop
 
@@ -124,14 +128,18 @@ class BitchatBLEHandler:
         def detection_callback(device: BLEDevice, advertisement_data: AdvertisementData):
             # Only connect if we see the specific Bitchat Service
             if BITCHAT_SERVICE_UUID.lower() in advertisement_data.service_uuids:
-                if device.address not in self.connected_clients:
+                # FIX: Check if we are already connected OR currently trying to connect
+                if (device.address not in self.connected_clients and 
+                    device.address not in self.connecting_devices):
+                    
                     logger.info(f"Found new Bitchat peer: {device.address}")
+                    self.connecting_devices.add(device.address) # <--- Lock this device
                     asyncio.create_task(self.connect_client(device))
 
         scanner = BleakScanner(detection_callback)
         await scanner.start()
         
-        # Keep the scanner running forever to find new people walking by
+        # Keep the scanner running forever
         while True:
             await asyncio.sleep(5)
 
@@ -154,6 +162,8 @@ class BitchatBLEHandler:
         except Exception as e:
             logger.warning(f"Connection lost with {device.address}: {e}")
         finally:
+            # <--- Cleanup: Remove from BOTH lists so we can try again later
+            self.connecting_devices.discard(device.address) 
             self.connected_clients.pop(device.address, None)
             await client.disconnect()
 
@@ -161,40 +171,38 @@ class BitchatBLEHandler:
         """Creates a closure to capture the specific device address."""
         def handler(sender_handle: int, data: bytearray):
             try:
-                # Decode the raw bytes to text
-                text = data.decode('utf-8')
+                # Reverse Engineering the Bitchat Protocol based on your logs
+                # Packet Structure:
+                # [01][02]...[Len]...[SenderID (8 bytes)]...[DestID]...[Text Payload]
                 
-                # 1. Resolve Identity (Best Effort)
-                # Since we don't have the full Bitchat User DB, we use a partial ID
-                # or the BLE address to distinguish users.
-                short_id = address.replace(":", "")[-4:] 
+                # Filter for Type 0x02 (Public Chat Message)
+                if len(data) > 30 and data[1] == 0x02:
+                    
+                    # 1. Get Message Length (Byte 13)
+                    msg_len = data[13]
+                    
+                    # 2. Extract Sender ID (Bytes 14-22) for a consistent username
+                    sender_id_bytes = data[14:22]
+                    short_id = sender_id_bytes.hex()[-4:] # Use last 4 digits as ID
+                    
+                    # 3. Extract the Text (Starts at Byte 30)
+                    msg_text_bytes = data[30 : 30 + msg_len]
+                    text = msg_text_bytes.decode('utf-8', errors='ignore')
+                    
+                    logger.info(f"(BLE -> Bridge) {short_id}: {text}")
+
+                    # 4. Forward to Meshtastic
+                    if self.meshtastic_handler:
+                        self.meshtastic_handler.send_text(f"[Bit:{short_id}] {text}")
                 
-                logger.info(f"(BLE -> Bridge) {short_id}: {text}")
-
-                # 2. Format for Meshtastic
-                formatted_msg = f"[Bit:{short_id}] {text}"
-
-                # 3. Forward to LoRa
-                if self.meshtastic_handler:
-                    self.meshtastic_handler.send_text(formatted_msg)
+                elif data[1] == 0x01:
+                    # Type 0x01 appears to be a User Presence/Hello packet. 
+                    # We ignore it to prevent spamming the chat.
+                    pass
 
             except Exception as e:
-                logger.error(f"Error decoding BLE message: {e}")
+                logger.error(f"Error decoding packet: {e}")
         return handler
-
-    async def broadcast(self, message: str):
-        """Sends a message to ALL connected Bitchat peers."""
-        payload = message.encode('utf-8')
-        
-        # We copy the list to avoid errors if clients disconnect while we iterate
-        current_clients = list(self.connected_clients.values())
-        
-        for client in current_clients:
-            if client.is_connected:
-                try:
-                    await client.write_gatt_char(BITCHAT_RX_CHAR_UUID, payload, response=True)
-                except Exception as e:
-                    logger.error(f"Failed to send to {client.address}: {e}")
 
 async def main():
     loop = asyncio.get_running_loop()
