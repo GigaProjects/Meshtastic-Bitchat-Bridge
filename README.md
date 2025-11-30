@@ -1,4 +1,4 @@
-### THIS IS A WORK IN PROGRESS
+### THIS IS A WORK IN PROGRESS... COMING IN EARLY 2026
 
 My attempt to make a usable Meshtastic-Bitchat Bridge that works in both directions
 
