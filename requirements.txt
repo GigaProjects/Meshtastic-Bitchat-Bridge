@@ -1,0 +1,4 @@
+bleak
+meshtastic
+pynacl
+lz4
