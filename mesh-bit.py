@@ -139,6 +139,7 @@ class BitchatBLEHandler:
         self.meshtastic_handler: Optional[MeshtasticHandler] = None
         self.loop = loop
         self._stopping = False
+        self.peer_nicknames = {}  # Store mapping of sender_id (hex) -> nickname
         
         # --- IDENTITY SETUP ---
         # Use random key for fresh identity on every run to avoid stale peer state on phone
@@ -415,16 +416,36 @@ class BitchatBLEHandler:
                     final_text = raw_payload.decode('utf-8', errors='ignore')
 
                 if packet_type == PACKET_TYPE_MESSAGE:
-                    logger.info(f"(BLE -> Bridge) {short_id}: {final_text}")
+                    sender_hex = sender_id.hex()
+                    display_name = self.peer_nicknames.get(sender_hex, short_id)
+                    
+                    logger.info(f"(BLE -> Bridge) {display_name}: {final_text}")
                     
                     if self.meshtastic_handler:
-                        self.meshtastic_handler.send_text(f"[Bit:{short_id}] {final_text}")
-                    
-
-
-
-                   
-
+                        self.meshtastic_handler.send_text(f"[Bit:{display_name}] {final_text}")
+                
+                elif packet_type == PACKET_TYPE_ANNOUNCE:
+                    try:
+                        # Parse TLV (Type-Length-Value)
+                        tlv_offset = 0
+                        while tlv_offset < len(raw_payload):
+                            if tlv_offset + 2 > len(raw_payload): break
+                            tag = raw_payload[tlv_offset]
+                            length = raw_payload[tlv_offset + 1]
+                            tlv_offset += 2
+                            if tlv_offset + length > len(raw_payload): break
+                            value = raw_payload[tlv_offset:tlv_offset + length]
+                            tlv_offset += length
+                            
+                            if tag == 0x01: # Nickname Tag
+                                nickname = value.decode('utf-8', errors='ignore')
+                                sender_hex = sender_id.hex()
+                                if self.peer_nicknames.get(sender_hex) != nickname:
+                                    self.peer_nicknames[sender_hex] = nickname
+                                    logger.info(f"Peer {short_id} is now known as '{nickname}'")
+                                break
+                    except Exception as e:
+                        logger.warning(f"Failed to parse ANNOUNCE: {e}")
 
             except Exception as e:
                 logger.error(f"Packet processing error: {e}")
