@@ -1,4 +1,4 @@
-# Mesh-Bit Bridge
+# Meshtastic-Bitchat Bridge
 
 
 https://github.com/user-attachments/assets/1a6bbe64-2a4b-4703-8669-91dd1d708aa4
