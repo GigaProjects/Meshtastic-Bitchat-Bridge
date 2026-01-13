@@ -1,7 +1,7 @@
 # Meshtastic-Bitchat Bridge
 
 
-https://github.com/user-attachments/assets/1a6bbe64-2a4b-4703-8669-91dd1d708aa4
+https://github.com/user-attachments/assets/3ebd0c6f-3552-441d-bd7e-a3e5f88676d4
 
 
 A bidirectional bridge connecting Bitchat and Meshtastic. This tool allows local Bluetooth chat clients to communicate over long distances via LoRa radios, effectively extending the range of Bitchat using the Meshtastic network.
