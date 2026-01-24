@@ -140,6 +140,7 @@ class BitchatBLEHandler:
         self.loop = loop
         self._stopping = False
         self.peer_nicknames = {}  # Store mapping of sender_id (hex) -> nickname
+        self.failed_devices = {}  # Track devices that failed connection (address -> timestamp)
         
         # --- IDENTITY SETUP ---
         # Use random key for fresh identity on every run to avoid stale peer state on phone
@@ -172,6 +173,13 @@ class BitchatBLEHandler:
                 
                 for device, adv in devices.values():
                     if BITCHAT_SERVICE_UUID.lower() in adv.service_uuids:
+                        # Check blacklist (cool-down for 5 minutes)
+                        if device.address in self.failed_devices:
+                            if time.time() - self.failed_devices[device.address] < 300:
+                                continue
+                            else:
+                                del self.failed_devices[device.address] # Expired
+
                         # Only connect if not already connected or connecting
                         if (device.address not in self.connected_clients and 
                             device.address not in self.connecting_devices):
@@ -291,7 +299,9 @@ class BitchatBLEHandler:
         RETRY_DELAY = 2.0  # seconds
         
         for attempt in range(MAX_RETRIES):
-            client = BleakClient(device)
+            # Use address string instead of device object to force fresh resolution
+            # This helps with iOS RPA rotation and avoids stale BlueZ cache
+            client = BleakClient(device.address, timeout=10.0)
             try:
                 logger.info(f"Connection attempt {attempt + 1}/{MAX_RETRIES} to {device.address}")
                 await client.connect()
@@ -356,6 +366,8 @@ class BitchatBLEHandler:
                         break
                 else:
                     logger.error(f"❌ Failed to connect after {MAX_RETRIES} attempts")
+                    # Add to blacklist to avoid spamming pairing requests
+                    self.failed_devices[device.address] = time.time()
                     break
         
         # Clean up if all retries failed
