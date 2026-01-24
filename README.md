@@ -37,7 +37,7 @@ The script runs on a Linux device (like a Raspberry Pi or laptop) that has both 
 
 To prevent "Enter PIN to pair" popups on iOS devices, you must optimize the BlueZ configuration.
 
-**A. Edit Bluetooth Settings:**
+**Edit Bluetooth Settings:**
 Edit `/etc/bluetooth/main.conf`:
 ```bash
 sudo nano /etc/bluetooth/main.conf
@@ -49,7 +49,7 @@ ControllerMode = le
 Privacy = device
 ```
 
-**B. Disable Battery Plugin:**
+**Disable Battery Plugin:**
 The battery plugin often triggers pairing requests. You should disable it in the service definition.
 
 Edit the service file:
@@ -62,7 +62,7 @@ Find the `ExecStart` line and add `-P battery` at the end. Note that the path to
 ExecStart=/usr/libexec/bluetooth/bluetoothd -P battery
 ```
 
-**C. Apply Changes:**
+**Apply Changes:**
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl restart bluetooth
