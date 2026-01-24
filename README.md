@@ -33,6 +33,41 @@ The script runs on a Linux device (like a Raspberry Pi or laptop) that has both 
     pip install -r requirements.txt
     ```
 
+### Required for iOS Support
+
+To prevent "Enter PIN to pair" popups on iOS devices, you must optimize the BlueZ configuration.
+
+**A. Edit Bluetooth Settings:**
+Edit `/etc/bluetooth/main.conf`:
+```bash
+sudo nano /etc/bluetooth/main.conf
+```
+Find the `[General]` section and ensure these lines are set:
+```ini
+JustWorksRepairing = never
+ControllerMode = le
+Privacy = device
+```
+
+**B. Disable Battery Plugin:**
+The battery plugin often triggers pairing requests. You should disable it in the service definition.
+
+Edit the service file:
+```bash
+sudo nano /lib/systemd/system/bluetooth.service
+```
+Find the `ExecStart` line and add `-P battery` at the end. Note that the path to `bluetoothd` may vary depending on your distribution (e.g., `/usr/lib/...` or `/usr/libexec/...`):
+```ini
+# Example (keep your existing path, just add -P battery at the end)
+ExecStart=/usr/libexec/bluetooth/bluetoothd -P battery
+```
+
+**C. Apply Changes:**
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart bluetooth
+```
+
 ## Usage
 
 1.  Connect your Meshtastic device to the computer via USB.
