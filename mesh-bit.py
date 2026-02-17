@@ -6,8 +6,8 @@ import struct
 import random
 import signal
 import hashlib
-import hashlib
 from typing import Optional, List, Dict
+from collections import deque
 
 # Cryptography
 import nacl.signing
@@ -141,6 +141,7 @@ class BitchatBLEHandler:
         self._stopping = False
         self.peer_nicknames = {}  # Store mapping of sender_id (hex) -> nickname
         self.failed_devices = {}  # Track devices that failed connection (address -> timestamp)
+        self.processed_packets = deque(maxlen=100) # (sender_id, timestamp) for de-duplication
         
         # --- IDENTITY SETUP ---
         # Use random key for fresh identity on every run to avoid stale peer state on phone
@@ -309,6 +310,9 @@ class BitchatBLEHandler:
                     logger.info(f"✅ Connected to {device.address}")
                     self.connected_clients[device.address] = client
                     
+                    # Setup notification handler BEFORE handshake to avoid losing response
+                    await client.start_notify(BITCHAT_TX_CHAR_UUID, self._create_notification_handler(device.address))
+                    
                     # Send Handshake (ANNOUNCE)
                     logger.info("Sending Handshake...")
                     
@@ -336,8 +340,9 @@ class BitchatBLEHandler:
                     packet = self._build_packet(PACKET_TYPE_ANNOUNCE, handshake_payload, recipient_id=b'\xff'*8)
                     await client.write_gatt_char(BITCHAT_RX_CHAR_UUID, packet, response=True)
                     
-                    # Setup notification handler
-                    await client.start_notify(BITCHAT_TX_CHAR_UUID, self._create_notification_handler(device.address))
+                    # Handshake successful, register disconnect callback
+                    client.set_disconnected_callback(self._on_client_disconnect)
+                    self.connecting_devices.discard(device.address)
                     
                     return  # Success!
                     
@@ -370,11 +375,12 @@ class BitchatBLEHandler:
                     self.failed_devices[device.address] = time.time()
                     break
         
-        # Clean up if all retries failed
+        # Clean up if connection failed or loop ended
         self.connecting_devices.discard(device.address)
     
-    def _on_client_disconnect(self, address: str):
+    def _on_client_disconnect(self, client: BleakClient):
         """Callback when a BLE client disconnects"""
+        address = client.address
         logger.info(f"Client {address} disconnected")
         if address in self.connected_clients:
             del self.connected_clients[address]
@@ -387,6 +393,7 @@ class BitchatBLEHandler:
                 
                 # Parse Header
                 packet_type = data[1]
+                timestamp_raw = data[3:11]
                 flags = data[11]
                 payload_len = struct.unpack('>H', data[12:14])[0]
                 
@@ -400,14 +407,19 @@ class BitchatBLEHandler:
                 offset += 8
                 short_id = sender_id.hex()[-4:]
                 
+                # De-duplication Check
+                packet_id = (sender_id, timestamp_raw)
+                if packet_id in self.processed_packets:
+                    return # Skip duplicate
+                self.processed_packets.append(packet_id)
 
                 if has_recipient:
                     recipient_id = data[offset : offset+8]  # Log the recipient before skipping
-                    logger.info(f"Recipient ID: {recipient_id.hex()}")
+                    logger.debug(f"Recipient ID: {recipient_id.hex()}")
                     if all(b == 0xff for b in recipient_id):
-                        logger.info("Incoming is broadcast message")
+                        logger.debug("Incoming is broadcast message")
                     else:
-                        logger.info("Incoming is private message")
+                        logger.debug("Incoming is private message")
                     offset += 8
                     
                 # Extract Payload
