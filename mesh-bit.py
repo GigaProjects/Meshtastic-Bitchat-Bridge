@@ -62,6 +62,7 @@ HEADER_SIZE = 14
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(BRIDGE_TAG)
@@ -72,26 +73,83 @@ class MeshtasticHandler:
         self.interface = None
         self.loop = loop
         self.ble_handler: Optional['BitchatBLEHandler'] = None
+        self._reconnect_delay = 5  # Initial reconnect delay in seconds
+        self._max_reconnect_delay = 20  # Max backoff delay (reduced for faster recovery)
+        self._stopping = False
+        self._subscribed = False  # Track if we already subscribed to pubsub topics
 
     def set_ble_handler(self, handler):
         self.ble_handler = handler
 
-    def start(self):
-        try:
-            logger.info(f"Attempting connection to Meshtastic on {self.port}...")
-            self.interface = meshtastic.serial_interface.SerialInterface(self.port)
-            pub.subscribe(self.on_receive, "meshtastic.receive")
-            logger.info("Meshtastic interface ready.")
-        except Exception as e:
-            logger.error(f"Failed to connect to Meshtastic: {e}")
-            logger.info("Trying alternative port /dev/ttyUSB0...")
+    def _try_connect(self) -> bool:
+        """Attempt to connect to Meshtastic on primary or fallback port. Returns True on success."""
+        ports_to_try = [self.port, "/dev/ttyUSB0"]
+        for port in ports_to_try:
             try:
-                self.interface = meshtastic.serial_interface.SerialInterface("/dev/ttyUSB0")
-                pub.subscribe(self.on_receive, "meshtastic.receive")
-                logger.info("Meshtastic interface ready on /dev/ttyUSB0.")
-            except Exception as e2:
-                logger.error(f"Failed secondary connection: {e2}")
-                logger.info("Continuing in Bluetooth-only mode.")
+                logger.debug(f"Attempting connection to Meshtastic on {port}...")
+                self.interface = meshtastic.serial_interface.SerialInterface(port)
+                
+                # Get local node info for a more professional log
+                my_node = self.interface.getMyNodeInfo()
+                node_user = my_node.get('user', {})
+                long_name = node_user.get('longName', 'Unknown')
+                node_id = node_user.get('id', 'Unknown')
+                
+                # Subscribe to pubsub topics only once (they persist across reconnects)
+                if not self._subscribed:
+                    pub.subscribe(self.on_receive, "meshtastic.receive")
+                    pub.subscribe(self.on_connection_lost, "meshtastic.connection.lost")
+                    self._subscribed = True
+                
+                logger.info(f"Meshtastic interface ready on {port} (Node: {long_name} / {node_id})")
+                self._reconnect_delay = 5  # Reset backoff on success
+                return True
+            except Exception as e:
+                logger.debug(f"Failed to connect on {port}: {e}")
+        
+        return False
+
+    def start(self):
+        """Initial connection attempt."""
+        if not self._try_connect():
+            logger.warning("Meshtastic not available. Will keep retrying in the background.")
+            asyncio.run_coroutine_threadsafe(self._reconnect_loop(), self.loop)
+
+    def on_connection_lost(self, interface=None):
+        """Called when the Meshtastic serial connection is lost."""
+        logger.warning("Meshtastic connection lost! Cleaning up and scheduling reconnect...")
+        self._cleanup_interface()
+        # Schedule the async reconnect loop from any thread
+        asyncio.run_coroutine_threadsafe(self._reconnect_loop(), self.loop)
+
+    def _cleanup_interface(self):
+        """Safely close the old interface."""
+        if self.interface:
+            try:
+                self.interface.close()
+            except Exception:
+                pass
+            self.interface = None
+
+    async def _reconnect_loop(self):
+        """Attempt to reconnect with exponential backoff."""
+        delay = self._reconnect_delay
+        while not self._stopping and self.interface is None:
+            logger.debug(f"Attempting Meshtastic reconnect in {delay}s...")
+            await asyncio.sleep(delay)
+            
+            if self._stopping:
+                break
+            
+            if self._try_connect():
+                logger.info("Meshtastic reconnected successfully!")
+                return
+            
+            # Exponential backoff
+            delay = min(delay * 2, self._max_reconnect_delay)
+        
+        if self._stopping:
+            logger.info("Reconnect loop stopped (shutdown requested).")
 
     def get_sender_name(self, from_id: str) -> str:
         if self.interface and self.interface.nodes:
@@ -125,12 +183,22 @@ class MeshtasticHandler:
             logger.error(f"Error processing LoRa packet: {e}")
 
     def send_text(self, text: str):
-        if self.interface:
-            try:
-                logger.info(f"[Meshtastic] Sending packet: {text}")
-                self.interface.sendText(text)
-            except Exception as e:
-                logger.error(f"[Meshtastic] Send failed: {e}")
+        if self.interface is None:
+            logger.debug(f"Cannot relay to LoRa — interface is disconnected: {text}")
+            return
+        try:
+            logger.info(f"(Bridge -> LoRa) {text}")
+            self.interface.sendText(text)
+        except Exception as e:
+            logger.error(f"LoRa relay failed: {e}")
+            # If send fails, the connection is likely dead — trigger reconnect
+            logger.warning("Send failure suggests connection is dead. Triggering reconnect...")
+            self.on_connection_lost()
+
+    def stop(self):
+        """Stop reconnect attempts and close the interface."""
+        self._stopping = True
+        self._cleanup_interface()
 
 class BitchatBLEHandler:
     def __init__(self, loop: asyncio.AbstractEventLoop):
@@ -142,6 +210,7 @@ class BitchatBLEHandler:
         self.peer_nicknames = {}  # Store mapping of sender_id (hex) -> nickname
         self.failed_devices = {}  # Track devices that failed connection (address -> timestamp)
         self.processed_packets = deque(maxlen=100) # (sender_id, timestamp) for de-duplication
+        self._nickname_tasks = {} # (sender_id -> asyncio.Task) for debouncing Name changes for de-duplication
         
         # --- IDENTITY SETUP ---
         # Use random key for fresh identity on every run to avoid stale peer state on phone
@@ -157,12 +226,19 @@ class BitchatBLEHandler:
         # This matches the app's behavior where Identity is tied to the Signing Key.
         self.my_id = hashlib.sha256(self.public_key_bytes).digest()[:8]
         
-        logger.info(f"Bridge Identity: {self.my_id.hex()}")
-        logger.info(f"Full public key: {self.public_key_bytes.hex()}")  # Add this for debugging
+        logger.debug(f"Bridge Identity: {self.my_id.hex()}")
+        logger.debug(f"Full public key: {self.public_key_bytes.hex()}")
 
     def set_meshtastic_handler(self, handler):
         self.meshtastic_handler = handler
 
+    async def _log_nickname_deferred(self, short_id: str, sender_hex: str):
+        """Wait briefly before logging a nickname change to debounce typing events ('t' -> 'te' -> 'tes' -> 'test')"""
+        await asyncio.sleep(1.0) # Wait 1 second of stable typing
+        final_nickname = self.peer_nicknames.get(sender_hex)
+        if final_nickname:
+            logger.info(f"Peer {short_id} is now known as '{final_nickname}'")
+            
     async def run_scanner(self):
         """Continuously scan for Bitchat devices (Polling Mode)"""
         logger.info("Scanning for Bitchat devices...")
@@ -184,12 +260,12 @@ class BitchatBLEHandler:
                         # Only connect if not already connected or connecting
                         if (device.address not in self.connected_clients and 
                             device.address not in self.connecting_devices):
-                            logger.info(f"Found peer: {device.address}")
+                            logger.debug(f"Found peer: {device.address}")
                             self.connecting_devices.add(device.address)
                             asyncio.create_task(self.connect_client(device))
                             
             except Exception as e:
-                logger.warning(f"Scanner error: {e}")
+                logger.debug(f"Scanner error: {e}")
                 await asyncio.sleep(1.0)
             
             await asyncio.sleep(0.5)
@@ -245,7 +321,7 @@ class BitchatBLEHandler:
         
         timestamp_ms = int(time.time() * 1000)
         header.extend(struct.pack('>Q', timestamp_ms))
-        logger.info(f"Timestamp: {timestamp_ms} (Hex: {struct.pack('>Q', timestamp_ms).hex()})")
+        logger.debug(f"Timestamp: {timestamp_ms} (Hex: {struct.pack('>Q', timestamp_ms).hex()})")
         
         flags = FLAG_HAS_SIGNATURE
         if recipient_id:
@@ -275,7 +351,7 @@ class BitchatBLEHandler:
         # This matches BinaryProtocol.encode() behavior
         unsigned_packet_padded = self._pad_data(unsigned_packet)
         
-        logger.info(f"Unsigned block (PADDED) hex for signing: {unsigned_packet_padded.hex()}")
+        logger.debug(f"Unsigned block (PADDED) hex for signing: {unsigned_packet_padded.hex()}")
         
         # 3. Sign the PADDED unsigned packet
         signature = self.signing_key.sign(bytes(unsigned_packet_padded)).signature
@@ -302,19 +378,19 @@ class BitchatBLEHandler:
         for attempt in range(MAX_RETRIES):
             # Use address string instead of device object to force fresh resolution
             # This helps with iOS RPA rotation and avoids stale BlueZ cache
-            client = BleakClient(device.address, timeout=10.0)
+            client = BleakClient(device.address, timeout=10.0, disconnected_callback=self._on_client_disconnect)
             try:
-                logger.info(f"Connection attempt {attempt + 1}/{MAX_RETRIES} to {device.address}")
+                logger.debug(f"Connection attempt {attempt + 1}/{MAX_RETRIES} to {device.address}")
                 await client.connect()
                 if client.is_connected:
-                    logger.info(f"✅ Connected to {device.address}")
+                    logger.info(f"Connected to {device.address}")
                     self.connected_clients[device.address] = client
                     
                     # Setup notification handler BEFORE handshake to avoid losing response
                     await client.start_notify(BITCHAT_TX_CHAR_UUID, self._create_notification_handler(device.address))
                     
                     # Send Handshake (ANNOUNCE)
-                    logger.info("Sending Handshake...")
+                    logger.debug("Sending Handshake...")
                     
                     # ANNOUNCE Payload - Restore Tagged Structure
                     handshake_payload = bytearray()
@@ -339,16 +415,13 @@ class BitchatBLEHandler:
                     # This ensures the packet has the HAS_RECIPIENT flag set, which might be required for processing.
                     packet = self._build_packet(PACKET_TYPE_ANNOUNCE, handshake_payload, recipient_id=b'\xff'*8)
                     await client.write_gatt_char(BITCHAT_RX_CHAR_UUID, packet, response=True)
-                    
-                    # Handshake successful, register disconnect callback
-                    client.set_disconnected_callback(self._on_client_disconnect)
                     self.connecting_devices.discard(device.address)
                     
                     return  # Success!
                     
             except Exception as e:
                 error_msg = str(e)
-                logger.warning(f"Connection error: {error_msg}")
+                logger.debug(f"Connection error: {error_msg}")
                 
                 # Clean up failed connection
                 try:
@@ -362,15 +435,15 @@ class BitchatBLEHandler:
                     if "InProgress" in error_msg or "br-connection-canceled" in error_msg:
                         # These are transient errors, retry with backoff
                         delay = RETRY_DELAY * (2 ** attempt)  # Exponential backoff
-                        logger.info(f"⏳ Transient error, retrying in {delay:.1f}s...")
+                        logger.debug(f"Transient error, retrying in {delay:.1f}s...")
                         await asyncio.sleep(delay)
                         continue
                     else:
                         # Fatal error, don't retry
-                        logger.error(f"❌ Fatal connection error, giving up")
+                        logger.debug(f"Fatal connection error for {device.address}, giving up")
                         break
                 else:
-                    logger.error(f"❌ Failed to connect after {MAX_RETRIES} attempts")
+                    logger.debug(f"Failed to connect to {device.address} after {MAX_RETRIES} attempts")
                     # Add to blacklist to avoid spamming pairing requests
                     self.failed_devices[device.address] = time.time()
                     break
@@ -381,7 +454,7 @@ class BitchatBLEHandler:
     def _on_client_disconnect(self, client: BleakClient):
         """Callback when a BLE client disconnects"""
         address = client.address
-        logger.info(f"Client {address} disconnected")
+        logger.debug(f"BLE client {address} disconnected")
         if address in self.connected_clients:
             del self.connected_clients[address]
         self.connecting_devices.discard(address)
@@ -464,9 +537,23 @@ class BitchatBLEHandler:
                             if tag == 0x01: # Nickname Tag
                                 nickname = value.decode('utf-8', errors='ignore')
                                 sender_hex = sender_id.hex()
-                                if self.peer_nicknames.get(sender_hex) != nickname:
+                                
+                                # Bitchat sends progressive name updates char-by-char during initial typing.
+                                # Let's debounce these using an asyncio task that waits 1.0 second.
+                                old_nickname = self.peer_nicknames.get(sender_hex)
+                                
+                                if old_nickname != nickname:
                                     self.peer_nicknames[sender_hex] = nickname
-                                    logger.info(f"Peer {short_id} is now known as '{nickname}'")
+                                    
+                                    # Cancel any existing pending log task for this user
+                                    if sender_hex in self._nickname_tasks:
+                                        self._nickname_tasks[sender_hex].cancel()
+                                        
+                                    # Create a new debounced logging task
+                                    self._nickname_tasks[sender_hex] = asyncio.create_task(
+                                        self._log_nickname_deferred(short_id, sender_hex)
+                                    )
+                                    
                                 break
                     except Exception as e:
                         logger.warning(f"Failed to parse ANNOUNCE: {e}")
@@ -482,13 +569,13 @@ class BitchatBLEHandler:
             payload = message.encode('utf-8')
             packet = self._build_packet(PACKET_TYPE_MESSAGE, payload, recipient_id)
             
-            logger.info(f"Echo packet hex (padded): {packet.hex()}")  # Add this for debugging
+            logger.debug(f"Echo packet hex (padded): {packet.hex()}")
 
             current_clients = list(self.connected_clients.values())
             for client in current_clients:
                 if client.is_connected:
                     await client.write_gatt_char(BITCHAT_RX_CHAR_UUID, packet, response=True)
-                    logger.info(f"Echo sent to {client.address}")
+                    logger.debug(f"Broadcast sent to {client.address}")
         except Exception as e:
             logger.error(f"Broadcast failed: {e}")
 
@@ -505,6 +592,16 @@ class BitchatBLEHandler:
         self.connected_clients.clear()
 
 async def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Meshtastic-Bitchat Bridge")
+    parser.add_argument("--port", default=MESHTASTIC_PORT, help="Meshtastic serial port")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger().setLevel(logging.DEBUG)
+
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
@@ -514,7 +611,7 @@ async def main():
     loop.add_signal_handler(signal.SIGINT, handle_sigint)
     
     ble_handler = BitchatBLEHandler(loop)
-    meshtastic_handler = MeshtasticHandler(MESHTASTIC_PORT, loop)
+    meshtastic_handler = MeshtasticHandler(args.port, loop)
     
     ble_handler.set_meshtastic_handler(meshtastic_handler)
     meshtastic_handler.set_ble_handler(ble_handler)
@@ -526,6 +623,7 @@ async def main():
         await stop_event.wait()
     finally:
         logger.info("Shutting down...")
+        meshtastic_handler.stop()
         await ble_handler.stop()
         scanner_task.cancel()
         try:
